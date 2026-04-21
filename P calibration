@@ -1,0 +1,360 @@
+#### ===== BLOCK 0: Setup for P calibration ===== ####
+
+# 0.1: What are we calibrating?
+whatcal <- "TP"   # just a label for yourself (Total Phosphorus)
+
+# 0.2: Define key paths
+codedir = paste0(basedir,"/swat_LOC/R" )        # <--- CHANGE to where your R scripts live
+baseline_dir <- "~/copy_calib/calibfolder1"   # streamflow-calibrated + .mgt + soil P
+scratch_base <- "/dev/shm/sabrinam21"         # fast scratch space
+
+# 0.3: Create scratch base and P-calibration project folder
+dir.create(scratch_base, showWarnings = FALSE)
+setwd(scratch_base)
+
+caldir_P <- "VSACalib_P"
+dir.create(caldir_P, showWarnings = FALSE)
+setwd(caldir_P)
+
+# 0.4: Copy the *entire* calibrated baseline project into VSACalib_P
+#     (We NEVER touch baseline_dir directly during calibration)
+file.copy(
+  from      = list.files(baseline_dir, full.names = TRUE, recursive = TRUE),
+  to        = "./",
+  recursive = TRUE
+)
+
+# 0.5: Source helper scripts needed later
+source(file.path(codedir, "readSWAT_3.R"))
+save(readSWAT, file = "readSWAT.R")   # so objective functions can just load() it
+
+source(file.path(codedir, "alter_files.R"))
+# Rename local alter_files to avoid conflict with EcoHydRology::alter_files
+alter_files_LOC <- alter_files
+rm(alter_files)  # optional but keeps things clean
+
+
+# ===== BLOCK 2: Build calib_params_P (PSP, PHOSKD, PPERCO) =====
+
+# Load base change_params template from EcoHydRology
+change_params <- NULL
+load(file.path(path.package("EcoHydRology"), "data/change_params.rda"))
+
+# Use an existing basins.bsn scalar as template
+bsn_template <- subset(change_params, filetype == "basins.bsn")[1, ]
+
+# Make sure factor 'parameter' can accept new names
+if (!all(c("PSP", "PHOSKD", "PPERCO") %in% levels(change_params$parameter))) {
+  change_params$parameter <- factor(
+    change_params$parameter,
+    levels = unique(c(levels(change_params$parameter),
+                      "PSP", "PHOSKD", "PPERCO"))
+  )
+}
+
+make_bsn_param_row <- function(name, min_val, max_val, current_val) {
+  row <- bsn_template
+  row$parameter <- name
+  row$min       <- min_val
+  row$max       <- max_val
+  row$current   <- current_val
+  row$filetype  <- "basins.bsn"
+  row$alter_type <- "new"     # set value directly
+  row$multi      <- 1
+  # keep startstr, endstr, frformat, fwformat from template
+  row
+}
+
+# Ranges – you can tweak them if needed
+psp_row    <- make_bsn_param_row("PSP",    0.30, 0.70, 0.40)
+phoskd_row <- make_bsn_param_row("PHOSKD", 30,   150,  100)
+pperco_row <- make_bsn_param_row("PPERCO", 0.5,  5.0,  3.0)
+
+calib_params_P <- rbind(psp_row, phoskd_row, pperco_row)
+
+# Prepare SWAT input files for calibration (creates .unixorig etc.)
+setup_swatcal(calib_params_P)
+
+calib_params_P
+
+# ===== BLOCK 3: Objective function: swat_objective_function_Pevents =====
+
+swat_objective_function_Pevents <- function(x,
+                                            calib_range,   # kept for symmetry
+                                            calib_params,  # calib_params_P
+                                            rch = 3,
+                                            save_results = FALSE) {
+  pacman::p_load(SWATmodel, dplyr, EcoHydRology, base, topmodel, utils, stringr)
+  
+  # Update parameter values
+  calib_params$current <- x
+  
+  # Temporary directory (same style as your other functions)
+  tmpdir <- as.character(as.integer((runif(1) + 1) * 10000))
+  tmpdir <- paste(c(format(Sys.time(), "%s"), tmpdir, Sys.getpid()),
+                  sep = "", collapse = "")
+  print(tmpdir)
+  dir.create(tmpdir)
+  file.copy(list.files(), tmpdir)
+  setwd(tmpdir)
+  file.remove(list.files(pattern = "output\\."))
+  
+  # CN_DICT: neutral multipliers (no CN changes, but alter_files expects this)
+  CN_DICT <- list(
+    TI01 = 1, TI02 = 1, TI03 = 1, TI04 = 1, TI05 = 1,
+    TI06 = 1, TI07 = 1, TI08 = 1, TI09 = 1, TI10 = 1
+  )
+  
+  # Apply PSP, PHOSKD, PPERCO to basins.bsn
+  alter_files(calib_params, CN_dict = CN_DICT)
+  
+  # Run SWAT (Linux executable, as in your new_obj_function.R)
+  junkout <- system("~/new_swat/rev688_64rel_linux")
+  
+  # Load readSWAT helper and read output.rch
+  load("readSWAT.R")
+  outdata <- readSWAT("rch", ".")
+  
+  rch_data <- subset(outdata, outdata$RCH == rch)
+  rch_data$Date <- rch_data$mdate   # mdate is already Date
+  
+  # Read event table (must be in base folder and copied into tmpdir)
+  Events <- read.csv("Events.csv")
+  Events$start_date <- as.Date(Events$start_date, format = "%m/%d/%Y")
+  Events$end_date   <- as.Date(Events$end_date,   format = "%m/%d/%Y")
+  
+  # We assume Events$Tot_P is observed TP load per event (kg)
+  sim_P_totals <- numeric(nrow(Events))
+  
+  for (i in seq_len(nrow(Events))) {
+    ev_data <- subset(rch_data,
+                      Date >= Events$start_date[i] & Date <= Events$end_date[i])
+    sim_P_totals[i] <- sum(ev_data$TOT_Pkg, na.rm = TRUE)
+  }
+  
+  Events$Total_P_simulated <- sim_P_totals
+  
+  # Keep only events with both observed and simulated P
+  valid_idx <- which(!is.na(Events$Tot_P) & !is.na(Events$Total_P_simulated))
+  
+  if (length(valid_idx) < 3) {
+    NSE_P <- -1e6  # penalize if not enough events
+  } else {
+    NSE_P <- NSeff(Events$Total_P_simulated[valid_idx],
+                   Events$Tot_P[valid_idx])
+  }
+  
+  print(paste0("NSE_P = ", NSE_P))
+  
+  # Optional: save calibrated TxtInOut snapshot
+  if (save_results) {
+    for (diffname in grep("output|unixorig",
+                          grep(paste0(unique(calib_params[, 1]),
+                                      collapse = "|"),
+                               list.files(), value = TRUE),
+                          invert = TRUE, value = TRUE)) {
+      if (length(grep("calib", diffname)) > 0) next
+      junk1 <- readLines(diffname)
+      junk2 <- readLines(paste0("../", diffname))
+      difflocs <- as.numeric(strsplit(
+        paste0(as.data.frame(strsplit(ses(junk1, junk2), split = "c"))[2, ],
+               collapse = ","), split = ",")[[1]])
+      if (length(difflocs) > 0) {
+        write(diffname, "calibdiffs.txt", append = TRUE)
+        write(paste0(diffname, ":", junk1[difflocs], " < ", junk2[difflocs]),
+              "calibdiffs.txt", append = TRUE)
+      }
+    }
+    calibdir <- paste0("../calibP_", format(Sys.time(), format = "%Y%m%d%H%M"))
+    dir.create(calibdir)
+    file.copy(list.files(), calibdir)
+  }
+  
+  # Cleanup temp dir
+  file.remove(list.files())
+  setwd("../")
+  file.remove(tmpdir)
+  
+  # DEoptim minimizes; we want NSE_P → 1
+  return(abs(NSE_P - 1))
+}
+
+
+# ===== BLOCK 4: Run DEoptim for P calibration =====
+
+library(DEoptim)
+pacman::p_load(parallel)
+
+# Bounds from calib_params_P
+lower_P <- calib_params_P$min
+upper_P <- calib_params_P$max
+
+# Calibration period (mostly to remind yourself; Events controls detail)
+calib_range <- c("2020-12-01", "2023-12-31")   # adjust if needed
+
+cl <- parallel::makeCluster(8)   # choose core count
+set.seed(1234)
+
+outDEoptim_P <- DEoptim(
+  swat_objective_function_Pevents,
+  lower = lower_P,
+  upper = upper_P,
+  DEoptim.control(
+    cluster      = cl,
+    strategy     = 6,
+    NP           = 24,
+    itermax      = 200,
+    parallelType = "parallel",
+    packages     = c("stringr", "SWATmodel", "dplyr", "EcoHydRology",
+                     "base", "topmodel", "utils"),
+    parVar       = c("%<%", "NSeff", "read.fortran", "readSWAT", "alter_files")
+  ),
+  calib_range,
+  calib_params_P,
+  rch = 3
+)
+
+parallel::stopCluster(cl)
+
+# Save DEoptim result
+filename_P <- format(Sys.time(), "%Y%m%d%H%M_outDEoptim_P.RData")
+save(outDEoptim_P, file = filename_P)
+
+# Extract best P parameters
+best_P <- data.frame(
+  Params  = as.vector(calib_params_P$parameter),
+  bestmem = round(as.vector(outDEoptim_P$optim$bestmem), 4)
+)
+best_P
+
+# ===== BLOCK 5: Final calibrated P run and NSE check =====
+
+# Use best parameters
+x_best <- outDEoptim_P$optim$bestmem
+
+# Run objective once more with save_results = TRUE
+final_obj <- swat_objective_function_Pevents(
+  x              = x_best,
+  calib_range    = calib_range,
+  calib_params   = calib_params_P,
+  rch            = 3,
+  save_results   = TRUE
+)
+
+final_obj   # this is abs(NSE_P - 1); you can compute NSE_P = 1 - final_obj
+NSE_P_best  <- 1 - final_obj
+NSE_P_best
+
+### ===== BLOCK 6: Copy calibrated files to permanent folder ===== ###
+
+# 1. Locate the latest calibP_* folder created in /dev/shm
+calib_dirs <- list.dirs("/dev/shm/sabrinam21/VSACalib_P", 
+                        recursive = FALSE, full.names = TRUE)
+calib_dirs <- calib_dirs[grepl("calibP_", calib_dirs)]
+
+if (length(calib_dirs) == 0) {
+  stop("ERROR: No calibrated folder found. Did save_results=TRUE run correctly?")
+}
+
+# pick the most recent calibP_YYYYMMDDHHMM folder
+latest_calib <- calib_dirs[which.max(file.info(calib_dirs)$mtime)]
+
+cat("Latest calibrated folder found:\n", latest_calib, "\n")
+
+# 2. Define permanent directory
+perm_dir <- "~/copy_calib/P_calibrated"
+dir.create(perm_dir, showWarnings = FALSE, recursive = TRUE)
+
+# 3. Copy recursively
+file.copy(from = latest_calib,
+          to   = perm_dir,
+          recursive = TRUE)
+
+cat("Calibrated P project copied to:\n", perm_dir, "\n")
+
+
+## ---- A. Apply best P values and run SWAT once ----
+
+pacman::p_load(EcoHydRology, dplyr)
+
+# 1. Put best parameters into calib_params_P
+calib_params_P$current <- x_best   # x_best from Block 5
+
+# 2. Neutral CN_DICT so alter_files() is happy but CN unchanged
+CN_DICT <- list(
+  TI01 = 1, TI02 = 1, TI03 = 1, TI04 = 1, TI05 = 1,
+  TI06 = 1, TI07 = 1, TI08 = 1, TI09 = 1, TI10 = 1
+)
+
+# 3. Edit basins.bsn with best PSP / PHOSKD / PPERCO
+alter_files(calib_params_P, CN_dict = CN_DICT)
+
+# 4. Run SWAT
+system("~/new_swat/rev688_64rel_linux")
+
+# 5. Read output.rch and keep reach 3
+load("readSWAT.R")
+outdata  <- readSWAT("rch", ".")
+rch_data <- subset(outdata, RCH == 3)
+rch_data$Date <- rch_data$mdate
+
+# 6. Read event definitions + observed loads
+Events <- read.csv("Events.csv")
+Events$start_date <- as.Date(Events$start_date, "%m/%d/%Y")
+Events$end_date   <- as.Date(Events$end_date,   "%m/%d/%Y")
+
+# 7. Aggregate simulated TP per event (kg)
+sim_P <- numeric(nrow(Events))
+for (i in seq_len(nrow(Events))) {
+  ev <- subset(rch_data,
+               Date >= Events$start_date[i] &
+                 Date <= Events$end_date[i])
+  sim_P[i] <- sum(ev$TOT_Pkg, na.rm = TRUE)
+}
+Events$Total_P_simulated <- sim_P
+
+# 8. (Optional) recompute NSE to double-check
+valid <- which(!is.na(Events$Tot_P) & !is.na(Events$Total_P_simulated))
+NSE_P_check <- topmodel::NSeff(
+  Events$Total_P_simulated[valid],
+  Events$Tot_P[valid]
+)
+NSE_P_check
+
+
+#####################
+###plot###
+
+library(ggplot2)
+
+# If needed:
+# NSE_P <- NSE_P_best   # optional: rename your NSE object
+
+ggplot(Events, aes(x = end_date)) +
+  
+  # Points for simulated & observed
+  geom_point(aes(y = Total_P_simulated, color = "Simulated"), size = 2, alpha = 0.9) +
+  geom_point(aes(y = Tot_P, color = "Observed"), size = 2, alpha = 0.9) +
+  
+  # Labels
+  labs(
+    x = "",
+    y = "Total P (kg)",
+    title = paste0("NSE = ", round(as.numeric(NSE_P_best), 2)),
+    color = ""
+  ) +
+  
+  # Colors
+  scale_color_manual(
+    values = c("Simulated" = "magenta", "Observed" = "orange")
+  ) +
+  
+  # Theme
+  theme_minimal(base_size = 15) +
+  theme(
+    plot.title = element_text(size = 16, hjust = 0.5),
+    axis.title = element_text(size = 15),
+    axis.text  = element_text(size = 13),
+    panel.border = element_rect(color = "black", fill = NA, size = 1),
+    plot.margin = margin(t = 5, r = 25, b = 5, l = 5, unit = "pt")
+  )
