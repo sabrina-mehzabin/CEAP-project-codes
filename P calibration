@@ -4,15 +4,18 @@
 whatcal <- "TP"   # just a label for yourself (Total Phosphorus)
 
 # 0.2: Define key paths
+rm(list = objects())
+myhomedir = Sys.getenv("HOME")
+basedir = myhomedir
 codedir = paste0(basedir,"/swat_LOC/R" )        # <--- CHANGE to where your R scripts live
-baseline_dir <- "~/copy_calib/calibfolder1"   # streamflow-calibrated + .mgt + soil P
+baseline_dir <- "~/copy_calib/calibfolder2"   # streamflow-calibrated + .mgt + soil P
 scratch_base <- "/dev/shm/sabrinam21"         # fast scratch space
 
 # 0.3: Create scratch base and P-calibration project folder
 dir.create(scratch_base, showWarnings = FALSE)
 setwd(scratch_base)
 
-caldir_P <- "VSACalib_P"
+caldir_P <- "VSACalib_P2"
 dir.create(caldir_P, showWarnings = FALSE)
 setwd(caldir_P)
 
@@ -78,13 +81,13 @@ setup_swatcal(calib_params_P)
 calib_params_P
 
 # ===== BLOCK 3: Objective function: swat_objective_function_Pevents =====
-
 swat_objective_function_Pevents <- function(x,
                                             calib_range,   # kept for symmetry
                                             calib_params,  # calib_params_P
                                             rch = 3,
                                             save_results = FALSE) {
-  pacman::p_load(SWATmodel, dplyr, EcoHydRology, base, topmodel, utils, stringr)
+  # Packages are already loaded on workers via clusterEvalQ (see below)
+  # So we do NOT load or install packages here.
   
   # Update parameter values
   calib_params$current <- x
@@ -105,8 +108,8 @@ swat_objective_function_Pevents <- function(x,
     TI06 = 1, TI07 = 1, TI08 = 1, TI09 = 1, TI10 = 1
   )
   
-  # Apply PSP, PHOSKD, PPERCO to basins.bsn
-  alter_files(calib_params, CN_dict = CN_DICT)
+  # IMPORTANT: call our custom function, not EcoHydRology::alter_files
+  alter_files_LOC(calib_params, CN_dict = CN_DICT)
   
   # Run SWAT (Linux executable, as in your new_obj_function.R)
   junkout <- system("~/new_swat/rev688_64rel_linux")
@@ -183,16 +186,37 @@ swat_objective_function_Pevents <- function(x,
 # ===== BLOCK 4: Run DEoptim for P calibration =====
 
 library(DEoptim)
-pacman::p_load(parallel)
+library(parallel)
 
 # Bounds from calib_params_P
 lower_P <- calib_params_P$min
 upper_P <- calib_params_P$max
 
-# Calibration period (mostly to remind yourself; Events controls detail)
-calib_range <- c("2020-12-01", "2023-12-31")   # adjust if needed
+# Calibration period
+calib_range <- c("2020-12-01", "2023-12-31")
 
-cl <- parallel::makeCluster(8)   # choose core count
+# ---- Set up cluster ----
+cl <- parallel::makeCluster(16)   # use cores as you requested
+
+# Load required packages ONCE on each worker
+parallel::clusterEvalQ(cl, {
+  library(SWATmodel)
+  library(dplyr)
+  library(topmodel)   # NSeff comes from here
+  library(stringr)
+})
+
+
+# Export necessary objects/functions to cluster
+parallel::clusterExport(
+  cl,
+  varlist = c("swat_objective_function_Pevents",
+              "calib_params_P",
+              "calib_range",
+              "alter_files_LOC"),
+  envir = environment()
+)
+
 set.seed(1234)
 
 outDEoptim_P <- DEoptim(
@@ -202,12 +226,9 @@ outDEoptim_P <- DEoptim(
   DEoptim.control(
     cluster      = cl,
     strategy     = 6,
-    NP           = 24,
+    NP           = 24,     # you can increase to 30 if you like
     itermax      = 200,
-    parallelType = "parallel",
-    packages     = c("stringr", "SWATmodel", "dplyr", "EcoHydRology",
-                     "base", "topmodel", "utils"),
-    parVar       = c("%<%", "NSeff", "read.fortran", "readSWAT", "alter_files")
+    parallelType = "parallel"
   ),
   calib_range,
   calib_params_P,
@@ -215,6 +236,8 @@ outDEoptim_P <- DEoptim(
 )
 
 parallel::stopCluster(cl)
+
+
 
 # Save DEoptim result
 filename_P <- format(Sys.time(), "%Y%m%d%H%M_outDEoptim_P.RData")
@@ -248,7 +271,7 @@ NSE_P_best
 ### ===== BLOCK 6: Copy calibrated files to permanent folder ===== ###
 
 # 1. Locate the latest calibP_* folder created in /dev/shm
-calib_dirs <- list.dirs("/dev/shm/sabrinam21/VSACalib_P", 
+calib_dirs <- list.dirs("/dev/shm/sabrinam21/VSACalib_P2", 
                         recursive = FALSE, full.names = TRUE)
 calib_dirs <- calib_dirs[grepl("calibP_", calib_dirs)]
 
@@ -262,7 +285,7 @@ latest_calib <- calib_dirs[which.max(file.info(calib_dirs)$mtime)]
 cat("Latest calibrated folder found:\n", latest_calib, "\n")
 
 # 2. Define permanent directory
-perm_dir <- "~/copy_calib/P_calibrated"
+perm_dir <- "~/copy_calib/P_calibrated2"
 dir.create(perm_dir, showWarnings = FALSE, recursive = TRUE)
 
 # 3. Copy recursively
@@ -287,7 +310,7 @@ CN_DICT <- list(
 )
 
 # 3. Edit basins.bsn with best PSP / PHOSKD / PPERCO
-alter_files(calib_params_P, CN_dict = CN_DICT)
+alter_files(calib_params_P)
 
 # 4. Run SWAT
 system("~/new_swat/rev688_64rel_linux")
@@ -312,6 +335,8 @@ for (i in seq_len(nrow(Events))) {
   sim_P[i] <- sum(ev$TOT_Pkg, na.rm = TRUE)
 }
 Events$Total_P_simulated <- sim_P
+
+write.csv(Events, file = "Event_P.csv", row.names = FALSE)
 
 # 8. (Optional) recompute NSE to double-check
 valid <- which(!is.na(Events$Tot_P) & !is.na(Events$Total_P_simulated))
@@ -357,4 +382,63 @@ ggplot(Events, aes(x = end_date)) +
     axis.text  = element_text(size = 13),
     panel.border = element_rect(color = "black", fill = NA, size = 1),
     plot.margin = margin(t = 5, r = 25, b = 5, l = 5, unit = "pt")
+  )
+
+plot(Events$Total_P_simulated, Events$Tot_P)
+
+
+
+library(ggplot2)
+library(dplyr)
+
+
+df <- Events %>%
+  filter(!is.na(Total_P_simulated),
+         !is.na(Tot_P))
+
+# Compute R²
+lm_fit <- lm(Total_P_simulated ~ Tot_P, data = df)
+R2_val <- summary(lm_fit)$r.squared
+
+library(ggplot2)
+library(dplyr)
+
+df <- Events %>% 
+  filter(!is.na(Total_P_simulated),
+         !is.na(Tot_P))
+
+# Common max for both axes
+max_val <- max(df$Tot_P, df$Total_P_simulated, na.rm = TRUE)
+
+ggplot(df, aes(x = Tot_P, y = Total_P_simulated)) +
+  
+  # 1:1 reference line
+  geom_abline(intercept = 0, slope = 1,
+              color = "black", size = 1.1, linetype = "dashed") +
+  
+  # Points
+  geom_point(color = "red", size = 2.8, alpha = 0.9) +
+  
+  # Equal scales AND equal ranges → visually square
+  coord_fixed(ratio = 1,
+              xlim = c(0, max_val),
+              ylim = c(0, max_val),
+              clip = "on") +
+  
+  labs(
+    title = "Event-Scale P Calibration",
+    subtitle = paste0("NSE = ", round(as.numeric(NSE_P_best), 2),
+                      "   |   R² = ", round(R2_val, 2)),
+    x = "Observed TP (kg)",
+    y = "Simulated TP (kg)"
+  ) +
+  
+  theme_minimal(base_size = 15) +
+  theme(
+    plot.title    = element_text(size = 17, hjust = 0.5),
+    plot.subtitle = element_text(size = 15, hjust = 0.5),
+    axis.title    = element_text(size = 15),
+    axis.text     = element_text(size = 13),
+    panel.border  = element_rect(color = "black", fill = NA, size = 1),
+    plot.margin   = margin(t = 15, r = 20, b = 5, l = 5)
   )
